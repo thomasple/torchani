@@ -28,6 +28,9 @@ class SpeciesAEV(NamedTuple):
     species: Tensor
     aevs: Tensor
 
+class NbList(NamedTuple):
+    atom_index12: Tensor
+    vec: Tensor
 
 def cutoff_cosine(distances: Tensor, cutoff: float) -> Tensor:
     # assuming all elements in distances are smaller than cutoff
@@ -246,7 +249,8 @@ def triple_by_molecule(atom_index12: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     uniqued_central_atom_index, counts = torch.unique_consecutive(sorted_ai1, return_inverse=False, return_counts=True)
 
     # compute central_atom_index
-    pair_sizes = counts * torch.div(counts - 1,2,rounding_mode="floor")
+    #pair_sizes = counts * (counts - 1 ) // 2
+    pair_sizes =  torch.div(counts *(counts - 1) ,2,rounding_mode="floor")
     pair_indices = torch.repeat_interleave(pair_sizes)
     central_atom_index = uniqued_central_atom_index.index_select(0, pair_indices)
 
@@ -269,7 +273,8 @@ def triple_by_molecule(atom_index12: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
 
 def compute_aev(species: Tensor, coordinates: Tensor, triu_index: Tensor,
                 constants: Tuple[float, Tensor, Tensor, float, Tensor, Tensor, Tensor, Tensor],
-                sizes: Tuple[int, int, int, int, int], cell_shifts: Optional[Tuple[Tensor, Tensor]]) -> Tensor:
+                sizes: Tuple[int, int, int, int, int], cell_shifts: Optional[Tuple[Tensor, Tensor]],
+                nblist: Optional[NbList]=None) -> Tensor:
     Rcr, EtaR, ShfR, Rca, ShfZ, EtaA, Zeta, ShfA = constants
     num_species, radial_sublength, radial_length, angular_sublength, angular_length = sizes
     num_molecules = species.shape[0]
@@ -278,8 +283,12 @@ def compute_aev(species: Tensor, coordinates: Tensor, triu_index: Tensor,
     coordinates_ = coordinates
     coordinates = coordinates_.flatten(0, 1)
 
+    if nblist is not None:
+      atom_index12=nblist.atom_index12
+      vec = coordinates.index_select(0,atom_index12[0])-coordinates.index_select(0,atom_index12[1])
+      vec.data = nblist.vec.data
+    elif cell_shifts is None:
     # PBC calculation is bypassed if there are no shifts
-    if cell_shifts is None:
         atom_index12 = neighbor_pairs_nopbc(species == -1, coordinates_, Rcr)
         selected_coordinates = coordinates.index_select(0, atom_index12.view(-1)).view(2, -1, 3)
         vec = selected_coordinates[0] - selected_coordinates[1]
@@ -472,7 +481,8 @@ class AEVComputer(torch.nn.Module):
 
     def forward(self, input_: Tuple[Tensor, Tensor],
                 cell: Optional[Tensor] = None,
-                pbc: Optional[Tensor] = None) -> SpeciesAEV:
+                pbc: Optional[Tensor] = None,
+                nblist: Optional[NbList] = None) -> SpeciesAEV:
         """Compute AEVs
 
         Arguments:
@@ -524,7 +534,9 @@ class AEVComputer(torch.nn.Module):
             aev = self.compute_cuaev(species, coordinates)
             return SpeciesAEV(species, aev)
 
-        if cell is None and pbc is None:
+        if nblist is not None:
+            aev = compute_aev(species, coordinates, self.triu_index, self.constants(), self.sizes, None, nblist)
+        elif cell is None and pbc is None:
             aev = compute_aev(species, coordinates, self.triu_index, self.constants(), self.sizes, None)
         else:
             assert (cell is not None and pbc is not None)

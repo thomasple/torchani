@@ -33,7 +33,7 @@ import torch
 from torch import Tensor
 from typing import Tuple, Optional, NamedTuple
 from .nn import SpeciesConverter, SpeciesEnergies
-from .aev import AEVComputer
+from .aev import AEVComputer, NbList
 
 
 class SpeciesEnergiesQBC(NamedTuple):
@@ -82,7 +82,8 @@ class BuiltinModel(torch.nn.Module):
 
     def forward(self, species_coordinates: Tuple[Tensor, Tensor],
                 cell: Optional[Tensor] = None,
-                pbc: Optional[Tensor] = None) -> SpeciesEnergies:
+                pbc: Optional[Tensor] = None,
+                nblist: Optional[NbList] = None) -> SpeciesEnergies:
         """Calculates predicted properties for minibatch of configurations
 
         Args:
@@ -103,14 +104,15 @@ class BuiltinModel(torch.nn.Module):
         if species_coordinates[0].ge(self.aev_computer.num_species).any():
             raise ValueError(f'Unknown species found in {species_coordinates[0]}')
 
-        species_aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc)
+        species_aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc,nblist=nblist)
         species_energies = self.neural_networks(species_aevs)
         return self.energy_shifter(species_energies)
 
     @torch.jit.export
     def atomic_energies(self, species_coordinates: Tuple[Tensor, Tensor],
                         cell: Optional[Tensor] = None,
-                        pbc: Optional[Tensor] = None) -> SpeciesEnergies:
+                        pbc: Optional[Tensor] = None,
+                        nblist: Optional[NbList] = None) -> SpeciesEnergies:
         """Calculates predicted atomic energies of all atoms in a molecule
 
         ..warning::
@@ -135,7 +137,7 @@ class BuiltinModel(torch.nn.Module):
         """
         if self.periodic_table_index:
             species_coordinates = self.species_converter(species_coordinates)
-        species, aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc)
+        species, aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc, nblist=nblist)
         atomic_energies = self.neural_networks._atomic_energies((species, aevs))
         self_energies = self.energy_shifter.self_energies.clone().to(species.device)
         self_energies = self_energies[species]
@@ -225,7 +227,9 @@ class BuiltinEnsemble(BuiltinModel):
     @torch.jit.export
     def atomic_energies(self, species_coordinates: Tuple[Tensor, Tensor],
                         cell: Optional[Tensor] = None,
-                        pbc: Optional[Tensor] = None, average: bool = True) -> SpeciesEnergies:
+                        pbc: Optional[Tensor] = None,
+                        nblist: Optional[NbList] = None,
+                        average: bool = True) -> SpeciesEnergies:
         """Calculates predicted atomic energies of all atoms in a molecule
 
         see `:method:torchani.BuiltinModel.atomic_energies`
@@ -236,7 +240,7 @@ class BuiltinEnsemble(BuiltinModel):
         """
         if self.periodic_table_index:
             species_coordinates = self.species_converter(species_coordinates)
-        species, aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc)
+        species, aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc,nblist=nblist)
         members_list = []
         for nnp in self.neural_networks:
             members_list.append(nnp._atomic_energies((species, aevs)).unsqueeze(0))
@@ -295,7 +299,8 @@ class BuiltinEnsemble(BuiltinModel):
     @torch.jit.export
     def members_energies(self, species_coordinates: Tuple[Tensor, Tensor],
                          cell: Optional[Tensor] = None,
-                         pbc: Optional[Tensor] = None) -> SpeciesEnergies:
+                         pbc: Optional[Tensor] = None,
+                         nblist: Optional[NbList] = None) -> SpeciesEnergies:
         """Calculates predicted energies of all member modules
 
         ..warning::
@@ -322,7 +327,7 @@ class BuiltinEnsemble(BuiltinModel):
         """
         if self.periodic_table_index:
             species_coordinates = self.species_converter(species_coordinates)
-        species, aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc)
+        species, aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc,nblist=nblist)
         member_outputs = []
         for nnp in self.neural_networks:
             unshifted_energies = nnp((species, aevs)).energies
@@ -333,7 +338,9 @@ class BuiltinEnsemble(BuiltinModel):
     @torch.jit.export
     def energies_qbcs(self, species_coordinates: Tuple[Tensor, Tensor],
                       cell: Optional[Tensor] = None,
-                      pbc: Optional[Tensor] = None, unbiased: bool = True) -> SpeciesEnergiesQBC:
+                      pbc: Optional[Tensor] = None,
+                      nblist: Optional[NbList] = None,
+                      unbiased: bool = True) -> SpeciesEnergiesQBC:
         """Calculates predicted predicted energies and qbc factors
 
         QBC factors are used for query-by-committee (QBC) based active learning
@@ -368,7 +375,7 @@ class BuiltinEnsemble(BuiltinModel):
                 atoms, the shape of energies is (C,) and the shape of qbc
                 factors is also (C,).
         """
-        species, energies = self.members_energies(species_coordinates, cell, pbc)
+        species, energies = self.members_energies(species_coordinates, cell, pbc, nblist)
 
         # standard deviation is taken across ensemble members
         qbc_factors = energies.std(0, unbiased=unbiased)
