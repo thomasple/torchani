@@ -83,7 +83,8 @@ class BuiltinModel(torch.nn.Module):
     def forward(self, species_coordinates: Tuple[Tensor, Tensor],
                 cell: Optional[Tensor] = None,
                 pbc: Optional[Tensor] = None,
-                nblist: Optional[NbList] = None) -> SpeciesEnergies:
+                nblist: Optional[NbList] = None,
+                shift_energies: bool = True) -> SpeciesEnergies:
         """Calculates predicted properties for minibatch of configurations
 
         Args:
@@ -106,13 +107,14 @@ class BuiltinModel(torch.nn.Module):
 
         species_aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc,nblist=nblist)
         species_energies = self.neural_networks(species_aevs)
-        return self.energy_shifter(species_energies)
+        return self.energy_shifter(species_energies) if shift_energies else species_energies
 
     @torch.jit.export
     def atomic_energies(self, species_coordinates: Tuple[Tensor, Tensor],
                         cell: Optional[Tensor] = None,
                         pbc: Optional[Tensor] = None,
-                        nblist: Optional[NbList] = None) -> SpeciesEnergies:
+                        nblist: Optional[NbList] = None,
+                        shift_energies: bool = True) -> SpeciesEnergies:
         """Calculates predicted atomic energies of all atoms in a molecule
 
         ..warning::
@@ -139,12 +141,13 @@ class BuiltinModel(torch.nn.Module):
             species_coordinates = self.species_converter(species_coordinates)
         species, aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc, nblist=nblist)
         atomic_energies = self.neural_networks._atomic_energies((species, aevs))
-        self_energies = self.energy_shifter.self_energies.clone().to(species.device)
-        self_energies = self_energies[species]
-        self_energies[species == torch.tensor(-1, device=species.device)] = torch.tensor(0, device=species.device, dtype=torch.double)
-        # shift all atomic energies individually
-        assert self_energies.shape == atomic_energies.shape
-        atomic_energies += self_energies
+        if shift_energies:
+          self_energies = self.energy_shifter.self_energies.clone().to(species.device)
+          self_energies = self_energies[species]
+          self_energies[species == torch.tensor(-1, device=species.device)] = torch.tensor(0, device=species.device, dtype=torch.double)
+          # shift all atomic energies individually
+          assert self_energies.shape == atomic_energies.shape
+          atomic_energies += self_energies
         return SpeciesEnergies(species, atomic_energies)
 
     @torch.jit.export
@@ -229,6 +232,7 @@ class BuiltinEnsemble(BuiltinModel):
                         cell: Optional[Tensor] = None,
                         pbc: Optional[Tensor] = None,
                         nblist: Optional[NbList] = None,
+                        shift_energies: bool = True,
                         average: bool = True) -> SpeciesEnergies:
         """Calculates predicted atomic energies of all atoms in a molecule
 
@@ -246,12 +250,13 @@ class BuiltinEnsemble(BuiltinModel):
             members_list.append(nnp._atomic_energies((species, aevs)).unsqueeze(0))
         member_atomic_energies = torch.cat(members_list, dim=0)
 
-        self_energies = self.energy_shifter.self_energies.clone().to(species.device)
-        self_energies = self_energies[species]
-        self_energies[species == torch.tensor(-1, device=species.device)] = torch.tensor(0, device=species.device, dtype=torch.double)
-        # shift all atomic energies individually
-        assert self_energies.shape == member_atomic_energies.shape[1:]
-        member_atomic_energies += self_energies
+        if shift_energies:
+          self_energies = self.energy_shifter.self_energies.clone().to(species.device)
+          self_energies = self_energies[species]
+          self_energies[species == torch.tensor(-1, device=species.device)] = torch.tensor(0, device=species.device, dtype=torch.double)
+          # shift all atomic energies individually
+          assert self_energies.shape == member_atomic_energies.shape[1:]
+          member_atomic_energies += self_energies
         if average:
             return SpeciesEnergies(species, member_atomic_energies.mean(dim=0))
         return SpeciesEnergies(species, member_atomic_energies)
@@ -300,7 +305,8 @@ class BuiltinEnsemble(BuiltinModel):
     def members_energies(self, species_coordinates: Tuple[Tensor, Tensor],
                          cell: Optional[Tensor] = None,
                          pbc: Optional[Tensor] = None,
-                         nblist: Optional[NbList] = None) -> SpeciesEnergies:
+                         nblist: Optional[NbList] = None,
+                         shift_energies: bool = True) -> SpeciesEnergies:
         """Calculates predicted energies of all member modules
 
         ..warning::
@@ -331,7 +337,8 @@ class BuiltinEnsemble(BuiltinModel):
         member_outputs = []
         for nnp in self.neural_networks:
             unshifted_energies = nnp((species, aevs)).energies
-            shifted_energies = self.energy_shifter((species, unshifted_energies)).energies
+            shifted_energies = ( self.energy_shifter((species, unshifted_energies)).energies 
+                                  if shift_energies else unshifted_energies )
             member_outputs.append(shifted_energies.unsqueeze(0))
         return SpeciesEnergies(species, torch.cat(member_outputs, dim=0))
 
@@ -340,7 +347,8 @@ class BuiltinEnsemble(BuiltinModel):
                       cell: Optional[Tensor] = None,
                       pbc: Optional[Tensor] = None,
                       nblist: Optional[NbList] = None,
-                      unbiased: bool = True) -> SpeciesEnergiesQBC:
+                      unbiased: bool = True,
+                      shift_energies: bool = True) -> SpeciesEnergiesQBC:
         """Calculates predicted predicted energies and qbc factors
 
         QBC factors are used for query-by-committee (QBC) based active learning
@@ -375,7 +383,8 @@ class BuiltinEnsemble(BuiltinModel):
                 atoms, the shape of energies is (C,) and the shape of qbc
                 factors is also (C,).
         """
-        species, energies = self.members_energies(species_coordinates, cell, pbc, nblist)
+        species, energies = self.members_energies(species_coordinates, cell, pbc, nblist
+                                                    ,shift_energies=shift_energies)
 
         # standard deviation is taken across ensemble members
         qbc_factors = energies.std(0, unbiased=unbiased)

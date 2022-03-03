@@ -285,8 +285,11 @@ def compute_aev(species: Tensor, coordinates: Tensor, triu_index: Tensor,
 
     if nblist is not None:
       atom_index12=nblist.atom_index12
-      vec = coordinates.index_select(0,atom_index12[0])-coordinates.index_select(0,atom_index12[1])
-      vec.data = nblist.vec.data
+      selected_coordinates = coordinates.index_select(0, atom_index12.view(-1)).view(2, -1, 3)
+      vec = selected_coordinates[0] - selected_coordinates[1]
+       # we do the difference for autograd but replace with precomputed shifted vec 
+       # (that should include minimum image convention)
+      vec.data = nblist.vec.data 
     elif cell_shifts is None:
     # PBC calculation is bypassed if there are no shifts
         atom_index12 = neighbor_pairs_nopbc(species == -1, coordinates_, Rcr)
