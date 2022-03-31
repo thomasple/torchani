@@ -30,7 +30,7 @@ class SpeciesAEV(NamedTuple):
 
 class NbList(NamedTuple):
     atom_index12: Tensor
-    vec: Tensor
+    shifts: Tensor
 
 def cutoff_cosine(distances: Tensor, cutoff: float) -> Tensor:
     # assuming all elements in distances are smaller than cutoff
@@ -286,10 +286,7 @@ def compute_aev(species: Tensor, coordinates: Tensor, triu_index: Tensor,
     if nblist is not None:
       atom_index12=nblist.atom_index12
       selected_coordinates = coordinates.index_select(0, atom_index12.view(-1)).view(2, -1, 3)
-      vec = selected_coordinates[0] - selected_coordinates[1]
-       # we do the difference for autograd but replace with precomputed shifted vec 
-       # (that should include minimum image convention)
-      vec.data = nblist.vec.data 
+      vec = selected_coordinates[0] - selected_coordinates[1] + nblist.shifts
     elif cell_shifts is None:
     # PBC calculation is bypassed if there are no shifts
         atom_index12 = neighbor_pairs_nopbc(species == -1, coordinates_, Rcr)
