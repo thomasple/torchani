@@ -111,7 +111,7 @@ class ANIModel(torch.nn.ModuleDict):
         atomic_nets = OrderedDict()
         for atom_type in species:
           nn_struct=dict[atom_type]
-          key=nn_struct["key"]
+          key=nn_struct["key"] if "key" in nn_struct else atom_type
           layers=nn_struct["layers"]
           atomic_nets[key] = build_nn(input_size,layers)
 
