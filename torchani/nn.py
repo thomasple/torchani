@@ -3,6 +3,7 @@ from collections import OrderedDict
 from torch import Tensor
 from typing import Tuple, NamedTuple, Optional
 from . import utils
+from .aev import NbList
 
 
 class SpeciesEnergies(NamedTuple):
@@ -53,7 +54,8 @@ class ANIModel(torch.nn.ModuleDict):
 
     def forward(self, species_aev: Tuple[Tensor, Tensor],  # type: ignore
                 cell: Optional[Tensor] = None,
-                pbc: Optional[Tensor] = None) -> SpeciesEnergies:
+                pbc: Optional[Tensor] = None,
+                nblist: Optional[NbList] = None) -> SpeciesEnergies:
         species, aev = species_aev
         assert species.shape == aev.shape[:-1]
 
@@ -79,6 +81,64 @@ class ANIModel(torch.nn.ModuleDict):
                 output.masked_scatter_(mask, m(input_).flatten())
         output = output.view_as(species)
         return output
+    
+    @classmethod
+    def from_dict(cls,species,dict,input_size):
+        from . import neurochem
+        def build_layer(i,layer):
+            o = layer['nodes']
+            if layer['type'] != 0:
+                raise ValueError('Unsupported layer type')
+            module = torch.nn.Linear(i, o)
+            if 'weights' in layer:
+              module.weight.data = torch.tensor(layer['weights'])
+            if 'bias' in layer: 
+              module.bias.data = torch.tensor(layer['bias'])
+            activation = neurochem._get_activation(layer['activation'])
+            return o,module,activation
+
+        def build_nn(input_size,layers):
+            i=input_size
+            modules=[]
+            for layer in layers:
+              #print(layer)
+              i,module,activation=build_layer(i,layer)
+              modules.append(module)
+              if activation is not None:
+                modules.append(activation)
+            return torch.nn.Sequential(*modules)
+
+        atomic_nets = OrderedDict()
+        for atom_type in species:
+          nn_struct=dict[atom_type]
+          key=nn_struct["key"]
+          layers=nn_struct["layers"]
+          atomic_nets[key] = build_nn(input_size,layers)
+
+        return cls(atomic_nets)
+    
+    def to_dict(self, species, save_weights=True):
+        from . import neurochem
+        dict=OrderedDict()
+        for i,key in enumerate(self.keys()):
+          k=species[i]
+          dict[k]=OrderedDict()
+          dict[k]["key"]=key
+          dict[k]["layers"]=[]
+          for layer in self[key]:
+            if isinstance(layer,torch.nn.Linear):
+              dict[k]["layers"].append({
+                "nodes":layer.out_features,
+                "activation":6,
+                "type":0,
+              })
+              if save_weights:
+                dict[k]["layers"][-1]["weights"]=layer.weight.tolist()
+                dict[k]["layers"][-1]["bias"]=layer.bias.tolist()
+            else:
+              dict[k]["layers"][-1]["activation"]=neurochem._get_activation_code(layer)
+        return dict    
+
 
 
 class Ensemble(torch.nn.ModuleList):
@@ -90,7 +150,8 @@ class Ensemble(torch.nn.ModuleList):
 
     def forward(self, species_input: Tuple[Tensor, Tensor],  # type: ignore
                 cell: Optional[Tensor] = None,
-                pbc: Optional[Tensor] = None) -> SpeciesEnergies:
+                pbc: Optional[Tensor] = None,
+                nblist: Optional[NbList] = None) -> SpeciesEnergies:
         sum_ = 0
         for x in self:
             sum_ += x(species_input)[1]
@@ -106,9 +167,10 @@ class Sequential(torch.nn.ModuleList):
 
     def forward(self, input_: Tuple[Tensor, Tensor],  # type: ignore
                 cell: Optional[Tensor] = None,
-                pbc: Optional[Tensor] = None):
+                pbc: Optional[Tensor] = None,
+                nblist: Optional[NbList] = None):
         for module in self:
-            input_ = module(input_, cell=cell, pbc=pbc)
+            input_ = module(input_, cell=cell, pbc=pbc, nblist=nblist)
         return input_
 
 
@@ -142,7 +204,8 @@ class SpeciesConverter(torch.nn.Module):
 
     def forward(self, input_: Tuple[Tensor, Tensor],
                 cell: Optional[Tensor] = None,
-                pbc: Optional[Tensor] = None):
+                pbc: Optional[Tensor] = None,
+                nblist: Optional[NbList] = None):
         """Convert species from periodic table element index to 0, 1, 2, 3, ... indexing"""
         species, coordinates = input_
         converted_species = self.conv_tensor[species]

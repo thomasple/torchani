@@ -29,7 +29,8 @@ class Constants(collections.abc.Mapping):
             string chemical symbols to 1d long tensor.
     """
 
-    def __init__(self, filename):
+    def __init__(self, filename=None):
+        if filename is None: return
         self.filename = filename
         with open(filename) as f:
             for i in f:
@@ -52,6 +53,20 @@ class Constants(collections.abc.Mapping):
                     raise ValueError('unable to parse const file')
         self.num_species = len(self.species)
         self.species_to_tensor = ChemicalSymbolsToInts(self.species)
+    
+    @classmethod
+    def from_dict(cls,species,dict):
+      consts=Constants()
+      consts.species=species
+      consts.num_species=len(consts.species)
+      for k in dict.keys():
+        if isinstance(dict[k],list):
+          val=torch.tensor(dict[k])
+        else:
+          val=dict[k]
+        setattr(consts,k,val)
+      consts.species_to_tensor = ChemicalSymbolsToInts(consts.species)
+      return consts
 
     def __iter__(self):
         yield 'Rcr'
@@ -102,6 +117,19 @@ def _get_activation(activation_index):
     else:
         raise NotImplementedError(
             'Unexpected activation {}'.format(activation_index))
+
+def _get_activation_code(activation):
+    # Activation defined in:
+    # https://github.com/Jussmith01/NeuroChem/blob/stable1/src-atomicnnplib/cunetwork/cuannlayer_t.cu#L920
+    if activation is None:
+        return 6
+    elif isinstance(activation, Gaussian):
+        return 5
+    elif isinstance(activation, torch.nn.CELU):
+        return 9
+    else:
+        raise NotImplementedError(
+            f'Unexpected activation {activation}')
 
 
 def load_atomic_network(filename):

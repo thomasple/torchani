@@ -29,11 +29,14 @@ directly calculate energies or get an ASE calculator. For example:
     model0.species_to_tensor(['C', 'H', 'H', 'H', 'H'])
 """
 import os
+import json
 import torch
 from torch import Tensor
 from typing import Tuple, Optional, NamedTuple
-from .nn import SpeciesConverter, SpeciesEnergies
+from .nn import SpeciesConverter, SpeciesEnergies,ANIModel
 from .aev import AEVComputer, NbList
+from .utils import EnergyShifter
+from collections import OrderedDict
 
 
 class SpeciesEnergiesQBC(NamedTuple):
@@ -58,6 +61,50 @@ class BuiltinModel(torch.nn.Module):
         # a bit useless maybe
         self.consts = consts
         self.sae_dict = sae_dict
+    
+    @classmethod
+    def from_json(cls, json_file_path, periodic_table_index=False):
+        from . import neurochem
+        with open(json_file_path,"r") as f:
+          model_struct=json.load(f)
+
+        species=model_struct["species"]
+        num_species=len(species)
+        consts=neurochem.Constants.from_dict(species,model_struct["aev"])
+        aev_computer=AEVComputer(**consts)
+        if "self_energies" in model_struct:
+          energy_shifter = EnergyShifter(model_struct["self_energies"])
+        else:
+          energy_shifter = EnergyShifter([0.]*num_species)
+        species_converter=SpeciesConverter(species)
+
+        input_size=aev_computer.aev_length
+        nn=ANIModel.from_dict(species,model_struct["network_setup"],input_size)
+        return cls(
+          species_converter=species_converter,
+          aev_computer=aev_computer,
+          neural_networks=nn,
+          energy_shifter=energy_shifter,
+          species_to_tensor=consts.species_to_tensor,
+          consts=consts,
+          sae_dict=None,
+          periodic_table_index=periodic_table_index
+        )
+    
+    def to_json(self,json_file_path,save_weights=True, indent=None,**kwargs):
+        data=OrderedDict()
+        data["species"]=self.consts.species
+        data["self_energies"]=self.energy_shifter.self_energies.tolist()
+        data["aev"]={**self.consts}
+        species=self.consts.species
+        for k in data["aev"].keys():
+          if isinstance(data["aev"][k],torch.Tensor):
+            data["aev"][k]=data["aev"][k].tolist()
+        del data["aev"]["num_species"]
+        data["network_setup"]=self.neural_networks.to_dict(species,save_weights)
+        with open(json_file_path,"w") as f:
+          json.dump(data,f,indent=indent)
+      
 
     @classmethod
     def _from_neurochem_resources(cls, info_file_path, periodic_table_index=False, model_index=0):
@@ -404,6 +451,13 @@ class BuiltinEnsemble(BuiltinModel):
             length (:class:`int`): Number of networks in the ensemble
         """
         return len(self.neural_networks)
+    
+    def to_json(self, json_file_path, save_weights=True, indent=None,model_index=None,**kwargs):
+        if model_index is not None:
+          self[model_index].to_json(json_file_path, save_weights, indent,**kwargs)
+        else:
+          for i in range(len(self)):
+            self[i].to_json(json_file_path.replace(".json",f".{i}.json"), save_weights, indent)
 
 
 def ANI1x(periodic_table_index=False, model_index=None):
