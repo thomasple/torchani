@@ -123,7 +123,7 @@ class ANIModel(torch.nn.ModuleDict):
         for i,key in enumerate(self.keys()):
           k=species[i]
           dict[k]=OrderedDict()
-          dict[k]["key"]=key
+          if key != k: dict[k]["key"]=key
           dict[k]["layers"]=[]
           for layer in self[key]:
             if isinstance(layer,torch.nn.Linear):
