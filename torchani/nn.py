@@ -413,16 +413,19 @@ class AllegroMiniLayer(torch.nn.Module):
     
     @classmethod
     def from_dict(cls, d, len_x, len_v, len_aev):
+      oper = str(d['oper']).lower() if 'oper' in d else 'sum'
+      assert oper in cls.accepted_oper
+      if oper == 'sum': assert len_v == len_aev
+
       embedding = SequentialBuilder.from_dicts(len_x,d['embedding'])
       embedding_length = SequentialBuilder.get_out_features(embedding)
-      if embedding_length != len_v:
+      if embedding_length != len_aev:
           embedding.add_module(str(len(embedding)),torch.nn.Linear(embedding_length,len_aev))
 
-      oper = str(d['oper']).lower() if 'oper' in d else 'sum'
       compress = None
       if oper == 'tensor':
         if 'compress' in d:
-            compress = SequentialBuilder.from_dicts(len_v,d['compress'])
+            compress = SequentialBuilder.from_dicts(len_v*len_aev,d['compress'])
         elif len_v==1:
             compress = None
         else:
@@ -438,11 +441,11 @@ class AllegroMiniLayer(torch.nn.Module):
     
     def to_dict(self,species,save_weights=True):
       d={}
+      d["oper"] = self.oper
       d["embedding"] = SequentialBuilder.to_dicts(self.embedding,save_weights)
       d["latent"] = SequentialBuilder.to_dicts(self.latent,save_weights)
       if self.compress is not None:
         d["compress"] = SequentialBuilder.to_dicts(self.compress,save_weights)
-      d["oper"] = self.oper
       return d
 
 class AllegroMini(torch.nn.Sequential):
@@ -475,22 +478,24 @@ class AllegroMini(torch.nn.Sequential):
         n_layers = d['n_layers']
         assert n_layers > 0
         oper = str(d['oper']).lower() if 'oper' in d else 'sum'
+        assert oper in AllegroMiniLayer.accepted_oper
+        len_v0=1 if oper == 'tensor' else len_aev
         layers=[]
         if 'layers' in d:
           dl = d['layers']
           assert isinstance(dl,list)
           assert len(dl)==n_layers
-          layers.append(AllegroMiniLayer.from_dict(dl[0], len_x, 1,len_aev))
+          layers.append(AllegroMiniLayer.from_dict(dl[0], len_x, len_v0,len_aev))
           if len(dl)>1:
             for i in range(1,len(dl)):
               layers.append(AllegroMiniLayer.from_dict(dl[i], len_x, len_aev,len_aev))
         else:
-          layers.append(AllegroMiniLayer.from_dict(d, len_x, 1, len_aev))
+          layers.append(AllegroMiniLayer.from_dict(d, len_x, len_v0, len_aev))
           if n_layers>1:
             for i in range(1,n_layers):
               layers.append(AllegroMiniLayer.from_dict(d, len_x, len_aev, len_aev))
         
-        o= cls(len_x,*layers,oper=oper)
+        o=cls(len_x,*layers,oper=oper)
         for l in layers:
           assert l.oper == o.oper
         return o
