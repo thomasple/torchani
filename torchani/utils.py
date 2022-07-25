@@ -4,9 +4,19 @@ import torch.utils.data
 import math
 from collections import defaultdict
 from typing import Tuple, NamedTuple, Optional, Sequence, List, Dict
+from torchani.aev import NbList
 from torchani.units import sqrt_mhessian2invcm, sqrt_mhessian2milliev, mhessian2fconst
 from .nn import SpeciesEnergies
+from collections import OrderedDict
 
+
+def ensureOrderedDict(modules) -> OrderedDict:
+    if isinstance(modules, OrderedDict):
+        return modules
+    od = OrderedDict()
+    for i, m in enumerate(modules):
+        od[str(i)] = m
+    return od
 
 def stack_with_padding(properties, padding):
     output = defaultdict(list)
@@ -136,6 +146,18 @@ def map2central(cell, coordinates, pbc):
     return torch.matmul(coordinates_cell, cell)
 
 
+class EnergyScaler(torch.nn.Module):
+    def __init__(self,shift,scale):
+      super().__init__()
+      self.shift = shift
+      self.scale = scale
+    
+    def forward(self,species_energies: Tuple[Tensor, Tensor],*args,**kwargs):
+      species, energies = species_energies
+      return SpeciesEnergies(species, energies*self.scale + self.shift)
+
+
+
 class EnergyShifter(torch.nn.Module):
     """Helper class for adding and subtracting self atomic energies
 
@@ -181,8 +203,7 @@ class EnergyShifter(torch.nn.Module):
         return self_energies.sum(dim=1) + intercept
 
     def forward(self, species_energies: Tuple[Tensor, Tensor],
-                cell: Optional[Tensor] = None,
-                pbc: Optional[Tensor] = None) -> SpeciesEnergies:
+                *args, **kwargs) -> SpeciesEnergies:
         """(species, molecular energies)->(species, molecular energies + sae)
         """
         species, energies = species_energies

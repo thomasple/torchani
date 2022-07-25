@@ -169,6 +169,25 @@ class Transformations:
             return IterableAdapter(reenterable_iterable_factory)
 
     @staticmethod
+    def initialize_energy_scaler(reenterable_iterable, normalizer=None):
+        if isinstance(normalizer,utils.EnergyScaler):
+            Y = []
+            for n, d in enumerate(reenterable_iterable):
+              nat = len(d["species"])
+              Y.append(d['energies']/nat)
+            Y = numpy.array(Y)
+            mean = Y.mean()
+            std = Y.std()
+            normalizer.__init__(mean,std)
+        else:
+            mean,std = normalizer
+
+        gc.collect()
+        return reenterable_iterable
+
+
+
+    @staticmethod
     def subtract_self_energies(reenterable_iterable, self_energies=None, species_order=None):
         intercept = 0.0
         shape_inference = False

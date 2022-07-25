@@ -29,13 +29,12 @@ directly calculate energies or get an ASE calculator. For example:
     model0.species_to_tensor(['C', 'H', 'H', 'H', 'H'])
 """
 import os
-import json
 import torch
 from torch import Tensor
 from typing import Tuple, Optional, NamedTuple
-from .nn import SpeciesConverter, SpeciesEnergies,ANIModel
-from .aev import AEVComputer, NbList
-from .utils import EnergyShifter
+from .nn import PairwiseModel, SpeciesConverter, SpeciesEnergies,ANIModel
+from .aev import AEVComputer, NbList,SpeciesAEV
+from .utils import EnergyShifter,EnergyScaler
 from collections import OrderedDict
 
 
@@ -48,7 +47,9 @@ class SpeciesEnergiesQBC(NamedTuple):
 class BuiltinModel(torch.nn.Module):
     r"""Private template for the builtin ANI models """
 
-    def __init__(self, species_converter, aev_computer, neural_networks, energy_shifter, species_to_tensor, consts, sae_dict, periodic_table_index):
+    def __init__(self, species_converter, aev_computer, neural_networks, energy_shifter
+          , species_to_tensor, consts, sae_dict, periodic_table_index
+          , energy_scaler=None):
         super().__init__()
         self.species_converter = species_converter
         self.aev_computer = aev_computer
@@ -57,29 +58,48 @@ class BuiltinModel(torch.nn.Module):
         self._species_to_tensor = species_to_tensor
         self.species = consts.species
         self.periodic_table_index = periodic_table_index
+        self.energy_scaler = energy_scaler
 
         # a bit useless maybe
         self.consts = consts
         self.sae_dict = sae_dict
     
     @classmethod
-    def from_json(cls, json_file_path, periodic_table_index=False):
+    def from_dict(cls, model_struct, periodic_table_index=False,**kwargs):
         from . import neurochem
-        with open(json_file_path,"r") as f:
-          model_struct=json.load(f)
-
         species=model_struct["species"]
         num_species=len(species)
         consts=neurochem.Constants.from_dict(species,model_struct["aev"])
         aev_computer=AEVComputer(**consts)
+        if "aev_normalizer" in model_struct["aev"]:
+          aev_computer.set_aev_normalizer(consts.aev_normalizer)
         if "self_energies" in model_struct:
           energy_shifter = EnergyShifter(model_struct["self_energies"])
         else:
           energy_shifter = EnergyShifter([0.]*num_species)
+        if 'energy_scaler' in model_struct:
+          shift,scale = model_struct['energy_scaler']
+          energy_scaler=EnergyScaler(shift,scale)
+        else:
+          energy_scaler=None
         species_converter=SpeciesConverter(species)
 
-        input_size=aev_computer.aev_length
-        nn=ANIModel.from_dict(species,model_struct["network_setup"],input_size)
+        if 'network_type' in model_struct:
+            network_type = str(model_struct['network_type']).upper()
+        else:
+            network_type = 'ANIMODEL'
+        
+        if network_type == 'ANIMODEL':
+          input_size=aev_computer.aev_length
+          nn=ANIModel.from_dict(species,model_struct["network_setup"],input_size)
+        elif network_type == 'PAIRWISE':
+          aev_computer.enable_pairwise_encoding()
+          input_sizes=(aev_computer.pairwise_encoding_length
+                        ,aev_computer.aev_length)
+          nn=PairwiseModel.from_dict(model_struct["network_setup"],*input_sizes)
+        else:
+          raise ValueError("Unknown network type : {}".format(network_type))
+        
         return cls(
           species_converter=species_converter,
           aev_computer=aev_computer,
@@ -88,22 +108,89 @@ class BuiltinModel(torch.nn.Module):
           species_to_tensor=consts.species_to_tensor,
           consts=consts,
           sae_dict=None,
-          periodic_table_index=periodic_table_index
+          periodic_table_index=periodic_table_index,
+          energy_scaler=energy_scaler
         )
     
-    def to_json(self,json_file_path,save_weights=True, indent=None,**kwargs):
+    def to_dict(self,save_weights=True, rmse=None,**kwargs):
         data=OrderedDict()
+        if rmse is not None:
+          data["rmse"]=rmse
         data["species"]=self.consts.species
         data["self_energies"]=self.energy_shifter.self_energies.tolist()
-        data["aev"]={**self.consts}
+        if isinstance(self.neural_networks,ANIModel):
+          data["network_type"]="ANIMODEL"
+        elif isinstance(self.neural_networks,PairwiseModel):
+          data["network_type"]="PAIRWISE"
+        else:
+          raise ValueError("Unknown network type : {}".format(self.neural_networks))
+        if self.energy_scaler is not None:
+          data["energy_scaler"]=[self.energy_scaler.shift,self.energy_scaler.scale]
+        data["aev"]=self.aev_computer.to_dict()
         species=self.consts.species
-        for k in data["aev"].keys():
-          if isinstance(data["aev"][k],torch.Tensor):
-            data["aev"][k]=data["aev"][k].tolist()
-        del data["aev"]["num_species"]
         data["network_setup"]=self.neural_networks.to_dict(species,save_weights)
-        with open(json_file_path,"w") as f:
-          json.dump(data,f,indent=indent)
+        return data
+    
+    @classmethod
+    def from_file(cls, path:str,**kwargs):
+        if path.endswith(".yaml") or path.endswith(".yml"):
+          return cls.from_yaml(path,**kwargs)
+        elif path.endswith(".json"):
+          return cls.from_json(path,**kwargs)
+        elif path.endswith(".pkl"):
+          return cls.from_pickle(path,**kwargs)
+        else:
+          raise ValueError("Unknown file type")
+    
+    def to_file(self, path:str,**kwargs):
+        if path.endswith(".yaml") or path.endswith(".yml"):
+          return self.to_yaml(path,**kwargs)
+        elif path.endswith(".json"):
+          return self.to_json(path,**kwargs)
+        elif path.endswith(".pkl"):
+          return self.to_pickle(path,**kwargs)
+        else:
+          raise ValueError("Unknown file type")
+          
+    
+    @classmethod
+    def from_yaml(cls, path,**kwargs):
+        import yaml
+        with open(path,"r") as f:
+            model_struct=yaml.load(f, Loader=yaml.SafeLoader)
+        return cls.from_dict(model_struct,**kwargs)
+
+    def to_yaml(self,path,default_flow_style=False,**kwargs):
+        import yaml
+        data = self.to_dict(**kwargs)
+        with open(path,"w") as f:
+            yaml.dump(data,f, default_flow_style=default_flow_style)
+
+    @classmethod
+    def from_json(cls, path,**kwargs):
+        import json
+        with open(path,"r") as f:
+            model_struct=json.load(f)
+        return cls.from_dict(model_struct,**kwargs)
+
+    def to_json(self,path,indent=None,**kwargs):
+        import json
+        data = self.to_dict(**kwargs)
+        with open(path,"w") as f:
+            json.dump(data,f,indent=indent)
+    
+    @classmethod
+    def from_pickle(cls, path,**kwargs):
+        import pickle
+        with open(path,"rb") as f:
+            model_struct=pickle.load(f)
+        return cls.from_dict(model_struct,**kwargs)
+
+    def to_pickle(self,path,**kwargs):
+        import pickle
+        data = self.to_dict(**kwargs)
+        with open(path,"wb") as f:
+            pickle.dump(data,f)
       
 
     @classmethod
@@ -154,7 +241,12 @@ class BuiltinModel(torch.nn.Module):
 
         species_aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc,nblist=nblist)
         species_energies = self.neural_networks(species_aevs)
-        return self.energy_shifter(species_energies) if shift_energies else species_energies
+        
+        if self.energy_scaler is not None:
+            species_energies = self.energy_scaler(species_energies)
+        if shift_energies:
+            species_energies = self.energy_shifter(species_energies)
+        return species_energies
 
     @torch.jit.export
     def atomic_energies(self, species_coordinates: Tuple[Tensor, Tensor],
@@ -186,8 +278,12 @@ class BuiltinModel(torch.nn.Module):
         """
         if self.periodic_table_index:
             species_coordinates = self.species_converter(species_coordinates)
-        species, aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc, nblist=nblist)
-        atomic_energies = self.neural_networks._atomic_energies((species, aevs))
+        species_aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc,nblist=nblist)
+        atomic_energies = self.neural_networks._atomic_energies(species_aevs)
+        
+        species = species_aevs[0]
+        if self.energy_scaler is not None:
+          atomic_energies = self.energy_scaler.scale*atomic_energies + self.energy_scaler.shift
         if shift_energies:
           self_energies = self.energy_shifter.self_energies.clone().to(species.device)
           self_energies = self_energies[species]
@@ -196,6 +292,21 @@ class BuiltinModel(torch.nn.Module):
           assert self_energies.shape == atomic_energies.shape
           atomic_energies += self_energies
         return SpeciesEnergies(species, atomic_energies)
+    
+    def atomic_environments(self, species_coordinates: Tuple[Tensor, Tensor],
+                        cell: Optional[Tensor] = None,
+                        pbc: Optional[Tensor] = None,
+                        nblist: Optional[NbList] = None,
+                        *args,**kwargs) -> SpeciesAEV:
+        if self.periodic_table_index:
+            species_coordinates = self.species_converter(species_coordinates)
+        pairwise_encoding_save = self.aev_computer.compute_pairwise_encoding
+        if pairwise_encoding_save:
+            self.aev_computer.disable_pairwise_encoding()
+        species_aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc,nblist=nblist)
+        if pairwise_encoding_save:
+            self.aev_computer.enable_pairwise_encoding()
+        return species_aevs
 
     @torch.jit.export
     def _recast_long_buffers(self):
@@ -269,10 +380,11 @@ class BuiltinEnsemble(BuiltinModel):
     """
 
     def __init__(self, species_converter, aev_computer, neural_networks,
-                 energy_shifter, species_to_tensor, consts, sae_dict, periodic_table_index):
+                 energy_shifter, species_to_tensor, consts, sae_dict, periodic_table_index
+                 ,energy_scaler=None):
         super().__init__(species_converter, aev_computer, neural_networks,
                          energy_shifter, species_to_tensor, consts, sae_dict,
-                         periodic_table_index)
+                         periodic_table_index, energy_scaler)
 
     @torch.jit.export
     def atomic_energies(self, species_coordinates: Tuple[Tensor, Tensor],
@@ -297,6 +409,8 @@ class BuiltinEnsemble(BuiltinModel):
             members_list.append(nnp._atomic_energies((species, aevs)).unsqueeze(0))
         member_atomic_energies = torch.cat(members_list, dim=0)
 
+        if self.energy_scaler is not None:
+          member_atomic_energies = self.energy_scaler.scale*member_atomic_energies + self.energy_scaler.shift
         if shift_energies:
           self_energies = self.energy_shifter.self_energies.clone().to(species.device)
           self_energies = self_energies[species]
@@ -384,6 +498,8 @@ class BuiltinEnsemble(BuiltinModel):
         member_outputs = []
         for nnp in self.neural_networks:
             unshifted_energies = nnp((species, aevs)).energies
+            if self.energy_scaler is not None:
+                unshifted_energies = self.energy_scaler.scale*unshifted_energies + self.energy_scaler.shift
             shifted_energies = ( self.energy_shifter((species, unshifted_energies)).energies 
                                   if shift_energies else unshifted_energies )
             member_outputs.append(shifted_energies.unsqueeze(0))

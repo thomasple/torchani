@@ -55,17 +55,21 @@ class Constants(collections.abc.Mapping):
         self.species_to_tensor = ChemicalSymbolsToInts(self.species)
     
     @classmethod
-    def from_dict(cls,species,dict):
+    def from_dict(cls,species,d,root=True):
       consts=Constants()
-      consts.species=species
-      consts.num_species=len(consts.species)
-      for k in dict.keys():
-        if isinstance(dict[k],list):
-          val=torch.tensor(dict[k])
+      if root:
+        consts.species=species
+        consts.num_species=len(consts.species)
+      for k in d.keys():
+        if isinstance(d[k],list):
+          val=torch.tensor(d[k])
+        elif isinstance(d[k],dict):
+          val=cls.from_dict(species,d[k],root=False)
         else:
-          val=dict[k]
+          val=d[k]
         setattr(consts,k,val)
-      consts.species_to_tensor = ChemicalSymbolsToInts(consts.species)
+      if root:
+        consts.species_to_tensor = ChemicalSymbolsToInts(consts.species)
       return consts
 
     def __iter__(self):
