@@ -36,7 +36,7 @@ class SpeciesAEV(NamedTuple):
 class SpeciesAEVPairwise(NamedTuple):
     species: Tensor
     aevs: Tensor
-    central_atom:Tensor
+    vecpairs:VecPairs
     pairwise_encoding: Tensor
 class AEVNormalizer(NamedTuple):
     mean: Tensor
@@ -46,9 +46,9 @@ class NbList(NamedTuple):
     atom_index12: Tensor
     shifts: Tensor
 
-def cutoff_cosine(distances: Tensor, cutoff: float) -> Tensor:
+def cutoff_cosine(distances: Tensor, cutoff: float,p=1) -> Tensor:
     # assuming all elements in distances are smaller than cutoff
-    return 0.5 * torch.cos(distances * (math.pi / cutoff)) + 0.5
+    return (0.5 * torch.cos(distances * (math.pi / cutoff)) + 0.5)**p
 
 def cutoff_polynomial(distances:Tensor, cutoff:float, p:float) -> Tensor:
     # assuming all elements in distances are smaller than cutoff
@@ -365,13 +365,44 @@ def compute_pairwise_encoding(vecpairs:VecPairs, num_species:int,
     onehot.scatter_(1,allspecies12[0,:].view(-1,1),1.)
     onehot.scatter_(1,allspecies12[1,:].view(-1,1)+2,1.)
 
-    central_atom = atom_index12.t().flatten()
+    central_atom = atom_index12.flatten()
     #pairwise_aev=aev.view(aev.shape[0]*aev.shape[1],aev.shape[2])[central_atom,:]
     pairwise_encoding = torch.column_stack([onehot,radrad])
 
 
     return central_atom, pairwise_encoding
 
+def compute_aev_terms(vecpairs: VecPairs,
+                num_molecules:float, num_atoms:float,
+                triu_index: Tensor,
+                Rca: float,
+                radial_fn:Callable[[Tensor],Tensor],
+                angular_fn:Callable[[Tensor],Tensor],
+                sizes: Tuple[int, int, int, int, int]) :
+
+    vec, distances, atom_index12, species12 = vecpairs
+    num_species, radial_sublength, radial_length, angular_sublength, angular_length = sizes
+    num_species_pairs = angular_length // angular_sublength
+
+    radial_terms_ = radial_fn(distances)
+
+    # Rca is usually much smaller than Rcr, using neighbor list with cutoff=Rcr is a waste of resources
+    # Now we will get a smaller neighbor list that only cares about atoms with distances <= Rca
+    even_closer_indices = (distances <= Rca).nonzero().flatten()
+
+    # compute angular aev
+    central_atom_index, pair_index12, sign12 = triple_by_molecule(
+        atom_index12.index_select(1, even_closer_indices)
+    )
+    species12_small = species12.index_select(1, even_closer_indices)[:, pair_index12]
+    vec12 = vec.index_select(0, even_closer_indices)\
+            .index_select(0, pair_index12.view(-1)).view(2, -1, 3)\
+               * sign12.unsqueeze(-1)
+    species12_ = torch.where(sign12 == 1, species12_small[1], species12_small[0])
+    #angular_terms_ = angular_terms(Rca, ShfZ, EtaA, Zeta, ShfA, vec12)
+    angular_terms_ = angular_fn(vec12)
+
+    return (atom_index12,radial_terms_), (central_atom_index, pair_index12,angular_terms_)
 
 def compute_aev(vecpairs: VecPairs,
                 num_molecules:float, num_atoms:float,
@@ -507,6 +538,7 @@ class AEVComputer(torch.nn.Module):
         
         #self.cutoff_fn = cutoff_cosine
         self.cutoff_fn = partial(cutoff_polynomial,p=2)
+        #self.cutoff_fn = partial(cutoff_cosine,p=6)
         
         self.radial_fn = lambda d: radial_terms(d, Rcr=self.Rcr, EtaR=self.EtaR, ShfR=self.ShfR, cutoff_fn=self.cutoff_fn)
         self.angular_fn = lambda d: angular_terms(d, Rca=self.Rca, EtaA=self.EtaA, ShfZ=self.ShfZ, Zeta=self.Zeta, ShfA=self.ShfA, cutoff_fn=self.cutoff_fn)
@@ -709,6 +741,6 @@ class AEVComputer(torch.nn.Module):
 
         if self.compute_pairwise_encoding:
             central_atom, pairwise_encoding = compute_pairwise_encoding(vecpairs,self.num_species,self.radial_fn)
-            return SpeciesAEVPairwise(species, aev, central_atom, pairwise_encoding)
+            return SpeciesAEVPairwise(species, aev, vecpairs, pairwise_encoding)
 
         return SpeciesAEV(species, aev)

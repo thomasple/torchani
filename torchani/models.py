@@ -74,7 +74,10 @@ class BuiltinModel(torch.nn.Module):
         if "aev_normalizer" in model_struct["aev"]:
           aev_computer.set_aev_normalizer(consts.aev_normalizer)
         if "self_energies" in model_struct:
-          energy_shifter = EnergyShifter(model_struct["self_energies"])
+          self_energies=model_struct["self_energies"]
+          fit_intercept= len(self_energies)==num_species+1
+          if not fit_intercept: assert len(self_energies)==num_species
+          energy_shifter = EnergyShifter(self_energies,fit_intercept)
         else:
           energy_shifter = EnergyShifter([0.]*num_species)
         if 'energy_scaler' in model_struct:
@@ -95,8 +98,10 @@ class BuiltinModel(torch.nn.Module):
         elif network_type == 'PAIRWISE':
           aev_computer.enable_pairwise_encoding()
           input_sizes=(aev_computer.pairwise_encoding_length
-                        ,aev_computer.aev_length)
-          nn=PairwiseModel.from_dict(model_struct["network_setup"],*input_sizes)
+                        ,aev_computer.aev_length
+                        ,num_species)
+          nn=PairwiseModel.from_dict(model_struct["network_setup"]
+                  ,aev_computer.Rcr,*input_sizes)
         else:
           raise ValueError("Unknown network type : {}".format(network_type))
         
@@ -307,6 +312,35 @@ class BuiltinModel(torch.nn.Module):
         if pairwise_encoding_save:
             self.aev_computer.enable_pairwise_encoding()
         return species_aevs
+    
+    @torch.jit.export
+    def all_output(self, species_coordinates: Tuple[Tensor, Tensor],
+                        cell: Optional[Tensor] = None,
+                        pbc: Optional[Tensor] = None,
+                        nblist: Optional[NbList] = None,
+                        shift_energies: bool = True) -> SpeciesEnergies:
+        assert (hasattr(self.neural_networks, '_all_output')
+           and callable(getattr(self.neural_networks, '_all_output')))
+
+        if self.periodic_table_index:
+            species_coordinates = self.species_converter(species_coordinates)
+        species_aevs = self.aev_computer(species_coordinates, cell=cell, pbc=pbc,nblist=nblist)
+        output = self.neural_networks._all_output(species_aevs)
+
+        species = species_aevs[0]
+        if 'atomic_energies' in output:
+          if self.energy_scaler is not None:
+            output["atomic_energies"] = self.energy_scaler.scale*output["atomic_energies"] + self.energy_scaler.shift
+          if shift_energies:
+            self_energies = self.energy_shifter.self_energies.clone().to(species.device)
+            self_energies = self_energies[species]
+            self_energies[species == torch.tensor(-1, device=species.device)] = torch.tensor(0, device=species.device, dtype=torch.double)
+            # shift all atomic energies individually
+            assert self_energies.shape == output["atomic_energies"].shape
+            output["atomic_energies"] += self_energies
+          output["energy"] = output["atomic_energies"].sum(dim=1)
+
+        return output
 
     @torch.jit.export
     def _recast_long_buffers(self):

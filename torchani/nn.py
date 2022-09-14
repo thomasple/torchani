@@ -3,7 +3,7 @@ from collections import OrderedDict
 from torch import Tensor
 from typing import Tuple, NamedTuple, Optional, List
 from . import utils
-from .aev import NbList,SpeciesAEV, SpeciesAEVPairwise
+from .aev import NbList,SpeciesAEV, SpeciesAEVPairwise,cutoff_cosine
 
 
 class SpeciesEnergies(NamedTuple):
@@ -250,10 +250,12 @@ class SequentialBuilder:
             return torch.nn.Identity()
         elif activ == "GAUSSIAN":  # Gaussian
             return Gaussian()
-        elif activ == "CELU":  # CELU
+        elif activ == "CELU":
             return torch.nn.CELU(alpha=0.1)
-        elif activ == "SELU":  # CELU
+        elif activ == "SELU": 
             return torch.nn.SELU()
+        elif activ == "SOFTPLUS": 
+            return torch.nn.Softplus()
         else:
             raise NotImplementedError(
                 'Unexpected activation {}'.format(activ))
@@ -270,6 +272,8 @@ class SequentialBuilder:
             return "CELU"
         elif isinstance(activation, torch.nn.SELU):
             return "SELU"
+        elif isinstance(activation, torch.nn.Softplus):
+            return "SOFTPLUS"
         else:
             raise NotImplementedError(
                 f'Unexpected activation {activation}')
@@ -569,12 +573,32 @@ class PairwiseTransform(torch.nn.Module):
         return d
         
 class PairwiseModel(torch.nn.Module):
-    def __init__(self, modules,embedding=None,transform=None):
+    def __init__(self,num_species,cutoff,output
+                  ,embedding=None,transform=None
+                  ,repulsion=None,Eshift=0.):
       super().__init__()
-      if isinstance(modules, torch.nn.Sequential):
-        self.energy_model = modules
+
+      self.num_species=num_species
+      self.cutoff=cutoff
+
+      if isinstance(Eshift,float):
+        self.register_buffer('Eshift',torch.full((num_species,),Eshift))
+        #self.Eshift=torch.nn.Parameter(torch.full((num_species,),Eshift))
+      elif isinstance(Eshift,torch.Tensor):
+        assert Eshift.shape == torch.Size([self.num_species])
+        self.register_buffer('Eshift',torch.nn.Parameter(Eshift.clone()))
+        #self.Eshift=torch.nn.Parameter(Eshift.clone())
       else:
-        self.energy_model = torch.nn.Sequential(modules)
+        self.Eshift=torch.nn.Parameter(torch.zeros(num_species))
+      
+      assert isinstance(output,dict)
+      self.output_models = torch.nn.ModuleDict()
+      for k,v in output.items():
+        key = str(k).lower()
+        if isinstance(v, torch.nn.Sequential):
+          self.output_models[key] = v
+        else:
+          self.output_models[key] = torch.nn.Sequential(v)
       
       self.embedding = None
       if embedding is not None:
@@ -585,21 +609,28 @@ class PairwiseModel(torch.nn.Module):
       
       self.transform = transform
 
+      self.repulsion=repulsion is not None
+      if self.repulsion and isinstance(repulsion,bool):
+        self.repulsion=repulsion
+      if self.repulsion:
+        if isinstance(repulsion, torch.Tensor):
+          assert repulsion.shape == torch.Size([2,self.num_species])
+          self.Erep=torch.nn.Parameter(repulsion[0])
+          self.Prep=torch.nn.Parameter(repulsion[1])
+        else:
+          self.Erep=torch.nn.Parameter(torch.empty(self.num_species))
+          self.Prep=torch.nn.Parameter(torch.empty(self.num_species))
+          torch.nn.init.normal_(self.Erep,1,0.1)
+          torch.nn.init.constant_(self.Prep,1.)
+
     def forward(self, input: SpeciesAEVPairwise) -> SpeciesEnergies:
         species=input[0]
         atomic_energies = self._atomic_energies(input)
         # shape of atomic energies is (C, A)
         return SpeciesEnergies(species, torch.sum(atomic_energies, dim=1))
-
     
     @torch.jit.export
-    def _atomic_energies(self, input: SpeciesAEVPairwise) -> Tensor:
-        # Obtain the atomic energies associated with a given tensor of AEV's
-        species,aev,central_atom,pairwise_encoding = input
-        species_ = species.flatten()
-
-        pairwise_aev=aev.view(aev.shape[0]*aev.shape[1],aev.shape[2])[central_atom,:]
-
+    def _compute_embedding(self, pairwise_encoding, pairwise_aev) -> Tensor:
         if self.embedding is not None:
           embedding = self.embedding(pairwise_encoding)
         else:
@@ -609,15 +640,87 @@ class PairwiseModel(torch.nn.Module):
           pairwise_input = self.transform((embedding,pairwise_aev))
         else:
           pairwise_input = torch.column_stack([embedding,pairwise_aev])
+        
+        return pairwise_input
+
+    def _all_output(self, input: SpeciesAEVPairwise):
+        species,aev,vecpairs,pairwise_encoding = input
+        central_atom = torch.cat([vecpairs.atom_index12[0],vecpairs.atom_index12[1]])
+        dest_atom = torch.cat([vecpairs.atom_index12[1],vecpairs.atom_index12[0]])
+        pairwise_aev=aev.view(aev.shape[0]*aev.shape[1],aev.shape[2])[central_atom,:]
+        species_ = species.flatten()
+
+        pairwise_input = self._compute_embedding(pairwise_encoding,pairwise_aev)
+
+        output ={"species":species}
+        for k,model in self.output_models.items():
+          pairwise_output = model(pairwise_input)
+          key = k
           
-        pairwise_output = self.energy_model(pairwise_input)
+          if k=="energy": 
+            key="atomic_energies"
+            if self.repulsion:
+              pairwise_output += self._repulsion_energy(species_.shape[0],vecpairs)
+            cutoff=cutoff_cosine(vecpairs.distances,self.cutoff,p=2)
+            cutoff_all=torch.cat([cutoff,cutoff])
+            spc=species_[central_atom]
+            pairwise_output+=self.Eshift[spc]
+            pairwise_output*=cutoff_all.view(-1,1)
+          
+          atomic_output = pairwise_output.new_zeros(species_.shape[0],1)
+          atomic_output.index_add_(0, central_atom, pairwise_output)
+          if k=="charge":
+              atomic_output.index_add_(0, dest_atom, -pairwise_output)
+          
+          output[key] = atomic_output.view_as(species)
+          if key.startswith("ratio"):
+              output[key][species>=0] += 1.0
+
+        return output
+
+    
+    @torch.jit.export
+    def _atomic_energies(self, input: SpeciesAEVPairwise) -> Tensor:
+        assert 'energy' in self.output_models
+        # Obtain the atomic energies associated with a given tensor of AEV's
+        species,aev,vecpairs,pairwise_encoding = input
+        index12=vecpairs.atom_index12
+        central_atom = torch.cat([index12[0],index12[1]])
+        pairwise_aev=aev.view(aev.shape[0]*aev.shape[1],aev.shape[2])[central_atom,:]
+        species_ = species.flatten()
+
+        pairwise_input = self._compute_embedding(pairwise_encoding,pairwise_aev)
+          
+        #print(torch.max(vecpairs.distances))
+       
+        cutoff=cutoff_cosine(vecpairs.distances,self.cutoff,p=2)
+        cutoff_all=torch.cat([cutoff,cutoff])
+        pairwise_output = self.output_models["energy"](pairwise_input)
+
+        if self.repulsion:
+          pairwise_output += self._repulsion_energy(species_.shape[0],vecpairs)
+
+        spc=species_[central_atom]
+        pairwise_output+=self.Eshift[spc].view(-1,1)
+
         output = pairwise_output.new_zeros(species_.shape[0],1)
-        output.index_add_(0, central_atom, pairwise_output)
+        output.index_add_(0, central_atom, pairwise_output*cutoff_all.view(-1,1))
         output= output.view_as(species)
         return output
     
+    def _repulsion_energy(self,nat,vecpairs):
+        _,distances,index12,species12 = vecpairs
+        #output = distances.new_zeros(nat,1)
+        
+        P=0.5*(self.Prep[species12[0]].abs()+self.Prep[species12[1]].abs())
+        erep=(0.25*(self.Erep[species12[0]]*self.Erep[species12[1]]).sqrt()
+                *torch.exp(-P*distances))
+        #output.index_add_(0,index12[0],erep.view(-1,1))
+        #output.index_add_(0,index12[1],erep.view(-1,1))
+        return torch.cat([erep,erep]).view(-1,1)
+    
     @classmethod
-    def from_dict(cls,d,encoding_length,aev_length):
+    def from_dict(cls,d,cutoff,encoding_length,aev_length,num_species):
         embedding=None
         transform=None
         embedding_length=encoding_length
@@ -638,16 +741,36 @@ class PairwiseModel(torch.nn.Module):
                 raise ValueError("Unknown transform type: {}".format(ttype))
             input_size = transform.out_features
 
-        layers=SequentialBuilder.from_dicts(input_size,d["energy"])
-        return cls(layers,embedding,transform)
+        output={}
+        if 'output' in d:
+            assert isinstance(d["output"],dict)
+            for k,v in d["output"].items():
+                output[k]=SequentialBuilder.from_dicts(input_size,v)
+        if 'energy' in d:
+            output["energy"]=SequentialBuilder.from_dicts(input_size,d["energy"])
+
+        repulsion=None
+        if 'repulsion' in d: repulsion=d['repulsion']
+
+        Eshift=0.
+        if 'eshift' in d: Eshift=d["eshift"]
+          
+        return cls(num_species,cutoff,output
+                  ,embedding,transform,repulsion,Eshift=Eshift)
         
     
     def to_dict(self,species,save_weights=True):
-        d={"energy":SequentialBuilder.to_dicts(self.energy_model,save_weights)}
+        do={}
+        for k,v in self.output_models.items():
+            do[k]=SequentialBuilder.to_dicts(v,save_weights)
+        d={"output":do}
+        d["eshift"]=self.Eshift.tolist()
         if self.embedding is not None:
             d["embedding"]=SequentialBuilder.to_dicts(self.embedding,save_weights)
         if self.transform is not None:
             d["transform"]=self.transform.to_dict(species,save_weights)
+        if self.repulsion:
+            d["repulsion"]=torch.stack((self.Erep,self.Prep)).tolist()
         return d
       
     

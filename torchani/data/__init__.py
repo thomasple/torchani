@@ -167,6 +167,21 @@ class Transformations:
             return IterableAdapterWithLength(reenterable_iterable_factory, len(reenterable_iterable))
         except TypeError:
             return IterableAdapter(reenterable_iterable_factory)
+    
+    @staticmethod
+    def indices_to_species(reenterable_iterable, species_order=('H', 'C', 'N', 'O', 'F', 'S', 'Cl')):
+        if species_order == 'periodic_table':
+            species_order = utils.PERIODIC_TABLE
+        idx = {i:k for i, k in enumerate(species_order)}
+
+        def reenterable_iterable_factory():
+            for d in reenterable_iterable:
+                d['species'] = [idx[s] for s in d['species']]
+                yield d
+        try:
+            return IterableAdapterWithLength(reenterable_iterable_factory, len(reenterable_iterable))
+        except TypeError:
+            return IterableAdapter(reenterable_iterable_factory)
 
     @staticmethod
     def initialize_energy_scaler(reenterable_iterable, normalizer=None):
@@ -218,9 +233,11 @@ class Transformations:
             species = sorted(list(counts.keys()), key=lambda x: species_order.index(x))
 
             X = [counts[s] for s in species]
-            if shifter.fit_intercept:
-                X.append([1] * n)
+            #if shifter.fit_intercept:
+            #    X.append([1] * n)
             X = numpy.array(X).transpose()
+            if shifter.fit_intercept:
+                X = numpy.concatenate((X, numpy.ones((X.shape[0], 1))), axis=1)
             Y = numpy.array(Y)
             if Y.shape[0] == 0:
                 raise RuntimeError("subtract_self_energies could not find any energies in the provided dataset.\n"
