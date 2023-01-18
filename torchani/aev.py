@@ -536,8 +536,8 @@ class AEVComputer(torch.nn.Module):
             self.ShfZ=torch.nn.Parameter( ShfZ.view(1, 1, 1, -1))
 
         
-        #self.cutoff_fn = cutoff_cosine
-        self.cutoff_fn = partial(cutoff_polynomial,p=2)
+        self.cutoff_fn = cutoff_cosine
+        # self.cutoff_fn = partial(cutoff_polynomial,p=2)
         #self.cutoff_fn = partial(cutoff_cosine,p=6)
         
         self.radial_fn = lambda d: radial_terms(d, Rcr=self.Rcr, EtaR=self.EtaR, ShfR=self.ShfR, cutoff_fn=self.cutoff_fn)
