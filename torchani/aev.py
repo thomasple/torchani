@@ -14,7 +14,8 @@ if has_cuaev:
     # We need to import torchani.cuaev to tell PyTorch to initialize torch.ops.cuaev
     from . import cuaev  # type: ignore # noqa: F401
 else:
-    warnings.warn("cuaev not installed")
+    pass
+    #warnings.warn("cuaev not installed")
 
 if sys.version_info[:2] < (3, 7):
     class FakeFinal:
