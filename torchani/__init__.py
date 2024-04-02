@@ -52,10 +52,12 @@ try:
     from . import ase  # noqa: F401
     __all__.append('ase')
 except ImportError:
-    warnings.warn("Dependency not satisfied, torchani.ase will not be available")
+    pass
+    #warnings.warn("Dependency not satisfied, torchani.ase will not be available")
 
 try:
     from . import data  # noqa: F401
     __all__.append('data')
 except ImportError:
-    warnings.warn("Dependency not satisfied, torchani.data will not be available")
+    pass
+    #warnings.warn("Dependency not satisfied, torchani.data will not be available")
